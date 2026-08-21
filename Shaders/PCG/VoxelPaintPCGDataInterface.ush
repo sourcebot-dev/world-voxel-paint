@@ -1,0 +1,78 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+// ComputeFramework data-interface template for UVoxelPaintPCGDataInterface (M6 plan 6.3).
+// Instantiated once per DI instance in the collapsed compute graph: {DataInterfaceName} is
+// replaced by the unique instance name (e.g. DI3_WVPVoxelPaint) via FString::Format, so every
+// declaration and function below is name-mangled; only the un-braced text survives verbatim.
+// Parameter declarations mirror FVoxelPaintPCGDataInterfaceParameters member-for-member.
+//
+// This template is the ONLY includer of the core sampler library in the PCG kernel
+// translation unit - the kernel .usf includes nothing and calls the plain shim names
+// (WVPSampler_GetLayerWeights et al.) that ComputeFramework generates from these mangled
+// definitions. VoxelPaintSample.ush is '#pragma once' guarded, so a second DI instance in
+// the same graph re-including it is harmless.
+
+#include "/Plugin/WorldVoxelPaint/VoxelPaintSample.ush"
+
+StructuredBuffer<float4> {DataInterfaceName}_Volumes;
+StructuredBuffer<uint> {DataInterfaceName}_PageTables;
+StructuredBuffer<uint> {DataInterfaceName}_RecordIndices;
+Texture3D {DataInterfaceName}_BrickPool;
+Texture3D {DataInterfaceName}_SessionTexture;
+SamplerState {DataInterfaceName}_PoolSampler;
+uint {DataInterfaceName}_NumRecordIndices;
+uint {DataInterfaceName}_NumVolumes;
+uint {DataInterfaceName}_BrickSize;
+uint {DataInterfaceName}_UniqueBrickSize;
+int3 {DataInterfaceName}_PoolDimsInBricks;
+float3 {DataInterfaceName}_PoolTexelExtentRcp;
+float3 {DataInterfaceName}_EvaluationOriginHigh;
+float3 {DataInterfaceName}_EvaluationOriginLow;
+float3 {DataInterfaceName}_CameraCenter;
+float {DataInterfaceName}_EvaluationRadiusSq;
+int4 {DataInterfaceName}_ChannelAttributeIds;
+int {DataInterfaceName}_DensityWriteChannel;
+
+// Raw, unclamped four-channel layer-weight composite at a world-space position - identical
+// semantics to the Sample World Voxel Paint material node over a zero baseline. Performs the
+// large-world rebase here (double-float split subtract: High first, then Low - the same
+// origin the records were assembled against), then runs the grid-free sampler over the
+// pre-culled, ascending record index list. Neutral bindings + NumVolumes == 0 yield exact
+// zero for every position.
+float4 WVPSampler_GetLayerWeights_{DataInterfaceName}(float3 InWorldPos)
+{
+	const float3 Position = (InWorldPos - {DataInterfaceName}_EvaluationOriginHigh) - {DataInterfaceName}_EvaluationOriginLow;
+	return WVP_SampleVoxelPaintRecords(
+		{DataInterfaceName}_Volumes,
+		{DataInterfaceName}_PageTables,
+		{DataInterfaceName}_BrickPool,
+		{DataInterfaceName}_SessionTexture,
+		{DataInterfaceName}_PoolSampler,
+		{DataInterfaceName}_RecordIndices,
+		{DataInterfaceName}_NumRecordIndices,
+		{DataInterfaceName}_NumVolumes,
+		{DataInterfaceName}_BrickSize,
+		{DataInterfaceName}_UniqueBrickSize,
+		{DataInterfaceName}_PoolDimsInBricks,
+		{DataInterfaceName}_PoolTexelExtentRcp,
+		{DataInterfaceName}_CameraCenter,
+		{DataInterfaceName}_EvaluationRadiusSq,
+		Position);
+}
+
+// Game-thread-resolved output attribute id for channel 0..3 (PCG attribute ids never resolve
+// by name in HLSL). Out-of-range indices clamp to channel 3. An unresolved id is -1 and the
+// KERNEL must skip the write itself (the data-collection setters do NOT no-op on -1: their
+// only guard is ElementAddress > 0, and a -1 id aliases the header lookup onto the data's
+// element count, turning the store into buffer corruption on any non-empty data).
+int WVPSampler_GetChannelAttributeId_{DataInterfaceName}(uint InChannelIndex)
+{
+	return {DataInterfaceName}_ChannelAttributeIds[min(InChannelIndex, 3u)];
+}
+
+// Density channel to write (0..3), or -1 when bWriteDensity is off - the kernel then leaves
+// the copied-through input density untouched.
+int WVPSampler_GetDensityWriteChannel_{DataInterfaceName}()
+{
+	return {DataInterfaceName}_DensityWriteChannel;
+}

@@ -1,0 +1,43 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+// Editor-only automation-test shader (never cooked; see VoxelPaintSampleParityTestShader.h):
+// one thread per probe, each probe running the grid-free parameterized sampler exactly as an
+// external compute consumer would. Kept minimal on purpose - this file compiles into the
+// editor's global shader map, so an error here breaks editor startup.
+
+#include "/Engine/Private/Common.ush"
+#include "/Plugin/WorldVoxelPaint/VoxelPaintSample.ush"
+
+StructuredBuffer<float4> Volumes;
+StructuredBuffer<uint> PageTables;
+Texture3D BrickPool;
+Texture3D SessionTexture;
+SamplerState PoolSampler;
+StructuredBuffer<uint> RecordIndices;
+StructuredBuffer<float4> ProbePositions;   // xyz = evaluation-origin-relative probe position
+RWStructuredBuffer<float4> OutWeights;
+uint NumRecordIndices;
+uint NumVolumes;
+uint NumProbes;
+uint BrickSize;
+uint UniqueBrickSize;
+int3 PoolDimsInBricks;
+float3 PoolTexelExtentRcp;
+float3 CameraCenter;
+float EvaluationRadiusSq;
+
+[numthreads(THREADGROUP_SIZE, 1, 1)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint ProbeIndex = DispatchThreadId.x;
+	if (ProbeIndex >= NumProbes)
+	{
+		return;
+	}
+	OutWeights[ProbeIndex] = WVP_SampleVoxelPaintRecords(
+		Volumes, PageTables, BrickPool, SessionTexture, PoolSampler,
+		RecordIndices, NumRecordIndices, NumVolumes,
+		BrickSize, UniqueBrickSize, PoolDimsInBricks, PoolTexelExtentRcp,
+		CameraCenter, EvaluationRadiusSq,
+		ProbePositions[ProbeIndex].xyz);
+}

@@ -1,0 +1,66 @@
+# WorldVoxelPaint repository ignore rules
+#
+# Keep the distributable plugin files (WorldVoxelPaint.uplugin, Source/, Shaders/,
+# and any future Config/, Content/, Resources/, or required Build/ directories).
+
+# Generated Unreal/plugin output
+**/Binaries/
+**/DerivedDataCache/
+**/Intermediate/
+**/Saved/
+
+# Local plugin documentation, planning history, and publishing material
+**/Docs/
+**/DECISION_LOG.md
+**/blog-assets/
+**/blog-post-*.md
+**/*.plan-*.json
+**/*.plan-*.jsonl
+**/*.plan-*.md
+
+# Planning/assistant extension state
+**/.agents/
+**/.claude/
+**/.codex/
+**/.cursor/
+**/.openai/
+
+# IDE and editor-local files
+**/.idea/
+**/.vs/
+**/.vscode/
+**/*.code-workspace
+**/*.sln
+**/*.suo
+**/*.user
+**/*.userprefs
+**/*.xcworkspace/
+**/*.xcodeproj/
+
+# Compiled binaries, symbols, objects, and packaged/cooked output
+**/*.a
+**/*.app/
+**/*.dll
+**/*.dSYM/
+**/*.dylib
+**/*.exe
+**/*.exp
+**/*.lib
+**/*.modules
+**/*.o
+**/*.obj
+**/*.pak
+**/*.pdb
+**/*.so
+**/*.target
+**/*.ucas
+**/*.utoc
+
+# Logs, caches, temporary files, and OS metadata
+**/*.log
+**/*.tmp
+**/*.temp
+**/*~
+**/.DS_Store
+**/Desktop.ini
+**/Thumbs.db

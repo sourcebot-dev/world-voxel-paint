@@ -1,0 +1,24 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "/Engine/Private/Common.ush"
+#include "/Plugin/WorldVoxelPaint/VoxelPaintSample.ush"
+
+StructuredBuffer<uint2> PageWriteOps;
+RWStructuredBuffer<uint> RWPageTables;
+uint NumWrites;
+uint PageEntryCapacity;
+
+[numthreads(THREADGROUP_SIZE, 1, 1)]
+void PageScatterCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint WriteIndex = DispatchThreadId.x;
+	if (WriteIndex >= NumWrites)
+	{
+		return;
+	}
+	const uint2 Op = PageWriteOps[WriteIndex];
+	if (Op.x < PageEntryCapacity)
+	{
+		RWPageTables[Op.x] = Op.y;
+	}
+}

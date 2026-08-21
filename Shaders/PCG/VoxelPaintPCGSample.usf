@@ -1,0 +1,96 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+// "Sample World Voxel Paint" PCG GPU kernel (M6 plan 6.2). One thread per input point:
+// pass-through point processor that samples the painted voxel field at the point's position
+// and writes the four channel-weight attributes (raw/unclamped), optionally overwriting
+// Density with the selected channel, saturated.
+//
+// No #includes on purpose: the graph compiler force-includes /Engine/Private/ComputeShaderUtils.ush
+// (GetUnWrappedDispatchThreadId), the In_/Out_ data-collection accessors and
+// PCG_COPY_ALL_ATTRIBUTES_TO_OUTPUT arrive via the pin data interfaces + PCG's stock helper
+// sources (Super::GatherAdditionalSources), and the WVPSampler_* functions are shims
+// generated from UVoxelPaintPCGDataInterface's template - which is the single includer of
+// the core VoxelPaintSample.ush in this translation unit. Kernel source is loaded verbatim
+// (never FString::Format'ed), so braces here are safe.
+
+[numthreads(64, 1, 1)]
+void VoxelPaintPCGSampleCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	// Mark the kernel as executed. Must run before any early-out: the kernel still counts as
+	// executed when there are zero threads of real work.
+	if (all(GroupId == 0) && GroupIndex == 0)
+	{
+		Out_SetAsExecutedInternal();
+	}
+
+	const uint ThreadIndex = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, 64);
+	if (ThreadIndex >= GetNumThreads().x)
+	{
+		return;
+	}
+
+	uint InDataIndex, InElementIndex;
+	if (!In_GetThreadData(ThreadIndex, InDataIndex, InElementIndex))
+	{
+		return;
+	}
+
+	uint OutDataIndex, OutElementIndex;
+	if (!Out_GetThreadData(ThreadIndex, OutDataIndex, OutElementIndex))
+	{
+		return;
+	}
+
+	// Propagate the 'Removed' status to the output point, or it is resurrected downstream.
+	if (In_IsPointRemoved(InDataIndex, InElementIndex))
+	{
+		Out_RemovePoint(OutDataIndex, OutElementIndex);
+		return;
+	}
+
+	// Sample the paint field at the point's world position. Raw/unclamped composite over
+	// zero; absent pages and unpublished regions read exact zero (accepted staleness model).
+	const float3 WorldPosition = In_GetPosition(InDataIndex, InElementIndex);
+	const float4 LayerWeights = WVPSampler_GetLayerWeights(WorldPosition);
+
+	// Copy every point property and attribute through, then overwrite what this node
+	// computes (PCGNormalToDensity.usf shape).
+	PCG_COPY_ALL_ATTRIBUTES_TO_OUTPUT(Out, In, OutDataIndex, OutElementIndex, InDataIndex, InElementIndex);
+
+	// Each write is guarded on a resolved (>= 0) attribute id. An unresolved id (-1) must never
+	// reach Out_SetFloat: the data-collection setter only guards ElementAddress > 0, and a -1 id
+	// makes its header lookup read the data's (AttributeCount, ElementCount) pair as a header -
+	// FirstElementAddress then equals the element count (> 0 for any non-empty data), so the
+	// store would corrupt the collection buffer at a garbage offset. Unresolved ids are real:
+	// the static attribute table can overflow (PCG logs the error but still compiles+executes),
+	// which silently drops the attribute from the data description.
+	const int Id0 = WVPSampler_GetChannelAttributeId(0u);
+	const int Id1 = WVPSampler_GetChannelAttributeId(1u);
+	const int Id2 = WVPSampler_GetChannelAttributeId(2u);
+	const int Id3 = WVPSampler_GetChannelAttributeId(3u);
+	if (Id0 >= 0)
+	{
+		Out_SetFloat(OutDataIndex, OutElementIndex, Id0, LayerWeights.x);
+	}
+	if (Id1 >= 0)
+	{
+		Out_SetFloat(OutDataIndex, OutElementIndex, Id1, LayerWeights.y);
+	}
+	if (Id2 >= 0)
+	{
+		Out_SetFloat(OutDataIndex, OutElementIndex, Id2, LayerWeights.z);
+	}
+	if (Id3 >= 0)
+	{
+		Out_SetFloat(OutDataIndex, OutElementIndex, Id3, LayerWeights.w);
+	}
+
+	// Density: saturated write of the selected channel, or leave the copied-through input
+	// density untouched (-1). Saturation can never collide with the FLT_MAX removed-point
+	// sentinel, and the removed case already returned above.
+	const int DensityWriteChannel = WVPSampler_GetDensityWriteChannel();
+	if (DensityWriteChannel >= 0)
+	{
+		Out_SetDensity(OutDataIndex, OutElementIndex, saturate(LayerWeights[(uint)DensityWriteChannel]));
+	}
+}

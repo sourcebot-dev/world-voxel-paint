@@ -1,0 +1,82 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "/Engine/Private/Common.ush"
+
+#define WVP_HEATMAP_HEADER_COUNT_MASK 0x1FFu   // mirrors WorldVoxelPaint::GridHeaderCountMask
+#define WVP_HEATMAP_MAX_EVALUATED_CANDIDATES 32u // mirrors WorldVoxelPaint::MaxEvaluatedCandidatesPerCell
+#define WVP_HEATMAP_COUNT_SATURATION 8.0f
+#define WVP_HEATMAP_COST_PER_VOLUME 4.0f
+#define WVP_HEATMAP_COST_SATURATION 16.0f
+#define WVP_HEATMAP_ALPHA 0.5f
+#define WVP_HEATMAP_WARN_FLASH_HZ 2.0f
+#define WVP_HEATMAP_WARN_ALPHA 0.85f
+
+Texture2D<float> SceneDepthTexture;
+StructuredBuffer<uint> GridHeaders;
+int3 GridDims;
+float3 GridOrigin;
+float2 GridCellSize;
+float3 TranslatedWorldToRelative;
+uint HeatmapMode;
+
+void MainPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	OutColor = float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+	const int2 PixelPos = int2(SvPosition.xy);
+	const float DeviceZ = SceneDepthTexture.Load(int3(PixelPos, 0));
+	[branch]
+	if (DeviceZ <= 0.0f)
+	{
+		return;
+	}
+
+	const float3 TranslatedWorld = SvPositionToTranslatedWorld(float4(SvPosition.xy, DeviceZ, 1.0f));
+	const float3 Position = TranslatedWorld + TranslatedWorldToRelative;
+
+	const float3 CellSizes = float3(GridCellSize.x, GridCellSize.x, GridCellSize.y);
+	const float3 CellFloat = floor((Position - GridOrigin) / CellSizes);
+	[branch]
+	if (!(all(CellFloat >= 0.0f) && all(CellFloat < float3(GridDims))))
+	{
+		return;
+	}
+	const uint3 Cell = uint3(CellFloat);
+	const uint CellIndex = Cell.x + (uint)GridDims.x * (Cell.y + (uint)GridDims.y * Cell.z);
+	const uint Count = GridHeaders[CellIndex] & WVP_HEATMAP_HEADER_COUNT_MASK;
+	[branch]
+	if (Count == 0u)
+	{
+		return;
+	}
+
+	// At the per-cell evaluation cap the published Count saturates, so >= means the cell is
+	// either exactly at the cap or was truncated - both are authoring problems; flash so the
+	// warning is unmistakable against the saturated red ramp below.
+	[branch]
+	if (Count >= WVP_HEATMAP_MAX_EVALUATED_CANDIDATES)
+	{
+		const float Flash = step(0.5f, frac(View.RealTime * WVP_HEATMAP_WARN_FLASH_HZ));
+		OutColor = float4(lerp(float3(1.0f, 0.0f, 0.0f), float3(1.0f, 1.0f, 1.0f), Flash),
+			WVP_HEATMAP_WARN_ALPHA);
+		return;
+	}
+
+	float Normalized;
+	if (HeatmapMode == 2u)
+	{
+		Normalized = saturate((float)Count * WVP_HEATMAP_COST_PER_VOLUME / WVP_HEATMAP_COST_SATURATION);
+	}
+	else
+	{
+		Normalized = saturate((float)Count / WVP_HEATMAP_COUNT_SATURATION);
+	}
+
+	const float3 Green = float3(0.0f, 1.0f, 0.0f);
+	const float3 Yellow = float3(1.0f, 1.0f, 0.0f);
+	const float3 Red = float3(1.0f, 0.0f, 0.0f);
+	const float3 Ramp = Normalized < 0.5f
+		? lerp(Green, Yellow, Normalized * 2.0f)
+		: lerp(Yellow, Red, Normalized * 2.0f - 1.0f);
+	OutColor = float4(Ramp, WVP_HEATMAP_ALPHA);
+}

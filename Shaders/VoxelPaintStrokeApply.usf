@@ -1,0 +1,118 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ComputeShaderUtils.ush"
+
+// Op values mirror EVoxelPaintStrokeOp (VoxelPaintPickProvider.h).
+#define WVP_STROKE_OP_PAINT  0u
+#define WVP_STROKE_OP_ERASE  1u
+#define WVP_STROKE_OP_FLOOD  2u
+#define WVP_STROKE_OP_INVERT 3u
+#define WVP_STROKE_OP_SWAP   4u
+
+StructuredBuffer<uint> WorkList;
+RWTexture3D<float4> RWWorking;
+
+uint Op;
+uint WorkCount;
+float3 BrushCenterTexel;
+float BrushRadiusTexels;
+float Strength;
+float FalloffHotspot;
+float4 Color;
+uint ChannelMask;
+uint SwapChannels;
+int3 Resolution;
+
+uint3 WVPUnflattenTexel(uint Flat, int3 Res)
+{
+	const uint ResX = (uint)Res.x;
+	const uint ResY = (uint)Res.y;
+	uint3 Coord;
+	Coord.x = Flat % ResX;
+	const uint Slice = Flat / ResX;
+	Coord.y = Slice % ResY;
+	Coord.z = Slice / ResY;
+	return Coord;
+}
+
+float WVPGetComponent(float4 Value, uint Index)
+{
+	return Index == 0u ? Value.x : (Index == 1u ? Value.y : (Index == 2u ? Value.z : Value.w));
+}
+
+float4 WVPSetComponent(float4 Value, uint Index, float Component)
+{
+	if (Index == 0u) { Value.x = Component; }
+	else if (Index == 1u) { Value.y = Component; }
+	else if (Index == 2u) { Value.z = Component; }
+	else { Value.w = Component; }
+	return Value;
+}
+
+[numthreads(THREADGROUP_SIZE, 1, 1)]
+void StrokeApplyCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint ThreadId = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUP_SIZE);
+	if (ThreadId >= WorkCount)
+	{
+		return;
+	}
+	const uint3 Texel = WVPUnflattenTexel(WorkList[ThreadId], Resolution);
+	if (any(Texel >= uint3(Resolution)))
+	{
+		return;
+	}
+
+	const float4 Value = RWWorking[Texel];
+	float4 Result = Value;
+
+	if (Op == WVP_STROKE_OP_PAINT || Op == WVP_STROKE_OP_ERASE || Op == WVP_STROKE_OP_FLOOD)
+	{
+		float Weight = 1.0f;
+		if (Op != WVP_STROKE_OP_FLOOD)
+		{
+			const float Dist = length((float3)Texel - BrushCenterTexel);
+			const float Hotspot = saturate(FalloffHotspot) * BrushRadiusTexels;
+			Weight = Dist <= Hotspot
+				? 1.0f
+				: 1.0f - saturate((Dist - Hotspot) / max(BrushRadiusTexels - Hotspot, 0.0001f));
+		}
+		const float4 Target = Op == WVP_STROKE_OP_ERASE ? float4(0.0f, 0.0f, 0.0f, 0.0f) : Color;
+		const float Alpha = saturate(Strength * Weight);
+		[unroll]
+		for (uint Channel = 0u; Channel < 4u; ++Channel)
+		{
+			if ((ChannelMask & (1u << Channel)) != 0u)
+			{
+				Result = WVPSetComponent(Result, Channel,
+					lerp(WVPGetComponent(Value, Channel), WVPGetComponent(Target, Channel), Alpha));
+			}
+		}
+	}
+	else if (Op == WVP_STROKE_OP_INVERT)
+	{
+		[unroll]
+		for (uint Channel = 0u; Channel < 4u; ++Channel)
+		{
+			if ((ChannelMask & (1u << Channel)) != 0u)
+			{
+				Result = WVPSetComponent(Result, Channel, 1.0f - WVPGetComponent(Value, Channel));
+			}
+		}
+	}
+	else if (Op == WVP_STROKE_OP_SWAP)
+	{
+		const uint SrcChannel = SwapChannels & 0xFFu;
+		const uint DstChannel = (SwapChannels >> 8u) & 0xFFu;
+		if (SrcChannel < 4u && DstChannel < 4u
+			&& (ChannelMask & (1u << SrcChannel)) != 0u
+			&& (ChannelMask & (1u << DstChannel)) != 0u)
+		{
+			Result = WVPSetComponent(Result, SrcChannel, WVPGetComponent(Value, DstChannel));
+			Result = WVPSetComponent(Result, DstChannel, WVPGetComponent(Value, SrcChannel));
+		}
+	}
+
+	RWWorking[Texel] = Result;
+}

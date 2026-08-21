@@ -1,0 +1,267 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ComputeShaderUtils.ush"
+#include "/Engine/Private/WaveOpUtil.ush"
+#include "/Plugin/WorldVoxelPaint/VoxelPaintSample.ush"
+
+struct FWVPGridRange
+{
+	uint RecordIndex;
+	uint3 CellMin;
+	uint3 CellDims;
+	uint FirstThread;
+};
+
+StructuredBuffer<float4> Volumes;
+StructuredBuffer<FWVPGridRange> Ranges;
+StructuredBuffer<uint2> Nodes;
+StructuredBuffer<uint> ActiveCells;
+StructuredBuffer<uint> Counters;
+StructuredBuffer<uint> ErrorFlag;
+RWStructuredBuffer<uint> RWGridHeaders;
+RWStructuredBuffer<uint2> RWNodes;
+RWStructuredBuffer<uint> RWActiveCells;
+RWStructuredBuffer<uint> RWGridIndexList;
+RWStructuredBuffer<uint> RWCounters;
+RWStructuredBuffer<uint> RWErrorFlag;
+RWBuffer<uint> RWIndirectArgs;
+
+uint NumLiveCells;
+uint NumRanges;
+uint TotalThreads;
+uint KCap;
+int3 GridDims;
+int3 MaxDispatchThreadGroupsPerDimension;
+float3 GridOriginRel;
+float2 CellSize;
+
+#define WVP_SAT_EPSILON 1e-4f
+
+bool WVPOrientedBoxOverlapsCellAABB(float3 AabbCenter, float3 AabbExtent,
+	float4 WorldToVolumeQuat, float3 BoxCenter, float3 BoxHalfExtent)
+{
+	const float4 VolumeToWorldQuat = float4(-WorldToVolumeQuat.xyz, WorldToVolumeQuat.w);
+	const float3 Col0 = VoxelPaintQuatRotate(VolumeToWorldQuat, float3(1.0f, 0.0f, 0.0f));
+	const float3 Col1 = VoxelPaintQuatRotate(VolumeToWorldQuat, float3(0.0f, 1.0f, 0.0f));
+	const float3 Col2 = VoxelPaintQuatRotate(VolumeToWorldQuat, float3(0.0f, 0.0f, 1.0f));
+
+	const float3 R0 = float3(Col0.x, Col1.x, Col2.x);
+	const float3 R1 = float3(Col0.y, Col1.y, Col2.y);
+	const float3 R2 = float3(Col0.z, Col1.z, Col2.z);
+	const float3 AR0 = abs(R0) + WVP_SAT_EPSILON;
+	const float3 AR1 = abs(R1) + WVP_SAT_EPSILON;
+	const float3 AR2 = abs(R2) + WVP_SAT_EPSILON;
+
+	const float3 T = BoxCenter - AabbCenter;
+	const float3 A = AabbExtent;
+	const float3 B = BoxHalfExtent;
+
+	if (abs(T.x) > A.x + dot(B, AR0)) { return false; }
+	if (abs(T.y) > A.y + dot(B, AR1)) { return false; }
+	if (abs(T.z) > A.z + dot(B, AR2)) { return false; }
+
+	const float3 TB = float3(
+		T.x * R0.x + T.y * R1.x + T.z * R2.x,
+		T.x * R0.y + T.y * R1.y + T.z * R2.y,
+		T.x * R0.z + T.y * R1.z + T.z * R2.z);
+	if (abs(TB.x) > B.x + A.x * AR0.x + A.y * AR1.x + A.z * AR2.x) { return false; }
+	if (abs(TB.y) > B.y + A.x * AR0.y + A.y * AR1.y + A.z * AR2.y) { return false; }
+	if (abs(TB.z) > B.z + A.x * AR0.z + A.y * AR1.z + A.z * AR2.z) { return false; }
+
+	// L = A0 x Bj
+	if (abs(T.z * R1.x - T.y * R2.x) > A.y * AR2.x + A.z * AR1.x + B.y * AR0.z + B.z * AR0.y) { return false; }
+	if (abs(T.z * R1.y - T.y * R2.y) > A.y * AR2.y + A.z * AR1.y + B.x * AR0.z + B.z * AR0.x) { return false; }
+	if (abs(T.z * R1.z - T.y * R2.z) > A.y * AR2.z + A.z * AR1.z + B.x * AR0.y + B.y * AR0.x) { return false; }
+	// L = A1 x Bj
+	if (abs(T.x * R2.x - T.z * R0.x) > A.x * AR2.x + A.z * AR0.x + B.y * AR1.z + B.z * AR1.y) { return false; }
+	if (abs(T.x * R2.y - T.z * R0.y) > A.x * AR2.y + A.z * AR0.y + B.x * AR1.z + B.z * AR1.x) { return false; }
+	if (abs(T.x * R2.z - T.z * R0.z) > A.x * AR2.z + A.z * AR0.z + B.x * AR1.y + B.y * AR1.x) { return false; }
+	// L = A2 x Bj
+	if (abs(T.y * R0.x - T.x * R1.x) > A.x * AR1.x + A.y * AR0.x + B.y * AR2.z + B.z * AR2.y) { return false; }
+	if (abs(T.y * R0.y - T.x * R1.y) > A.x * AR1.y + A.y * AR0.y + B.x * AR2.z + B.z * AR2.x) { return false; }
+	if (abs(T.y * R0.z - T.x * R1.z) > A.x * AR1.z + A.y * AR0.z + B.x * AR2.y + B.y * AR2.x) { return false; }
+
+	return true;
+}
+
+[numthreads(THREADGROUP_SIZE, 1, 1)]
+void ClearHeadersCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint ThreadId = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUP_SIZE);
+	if (ThreadId < NumLiveCells)
+	{
+		RWGridHeaders[ThreadId] = 0u;
+	}
+}
+
+[numthreads(THREADGROUP_SIZE, 1, 1)]
+void DiscoverCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint ThreadId = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUP_SIZE);
+	if (ThreadId >= TotalThreads || NumRanges == 0u)
+	{
+		return;
+	}
+
+	uint Lo = 0u;
+	uint Hi = NumRanges - 1u;
+	[loop]
+	while (Lo < Hi)
+	{
+		const uint Mid = (Lo + Hi + 1u) >> 1u;
+		if (Ranges[Mid].FirstThread <= ThreadId)
+		{
+			Lo = Mid;
+		}
+		else
+		{
+			Hi = Mid - 1u;
+		}
+	}
+	const FWVPGridRange Range = Ranges[Lo];
+
+	const uint LocalIndex = ThreadId - Range.FirstThread;
+	uint3 CellRel;
+	CellRel.x = LocalIndex % Range.CellDims.x;
+	const uint Slice = LocalIndex / Range.CellDims.x;
+	CellRel.y = Slice % Range.CellDims.y;
+	CellRel.z = Slice / Range.CellDims.y;
+	const uint3 Cell = Range.CellMin + CellRel;
+
+	FWVPRecord Record;
+	WVP_DecodeRecord(Volumes, Range.RecordIndex, Record);
+
+	const float3 CellSizes = float3(CellSize.x, CellSize.x, CellSize.y);
+	const float3 CellMinPos = GridOriginRel + float3(Cell) * CellSizes;
+	const float3 CellCenter = CellMinPos + 0.5f * CellSizes;
+	const float3 CellExtent = 0.5f * CellSizes;
+
+	if (!WVPOrientedBoxOverlapsCellAABB(CellCenter, CellExtent,
+		Record.WorldToVolumeRotation, Record.VolumeCenter, Record.LocalHalfExtent))
+	{
+		return;
+	}
+
+	uint Node;
+#if WAVE_OPS
+	// Wave-aggregated allocation: one global atomic per wave, lanes get densely
+	// packed IDs via the wave prefix count inside WaveInterlockedAddScalar_.
+	WaveInterlockedAddScalar_(RWCounters[0], 1u, Node);
+#else
+	InterlockedAdd(RWCounters[0], 1u, Node);
+#endif
+	if (Node >= KCap)
+	{
+		RWErrorFlag[0] = 1u;
+		return;
+	}
+	const uint CellIndex = WVP_CellIndex(Cell, GridDims);
+	uint PrevHead;
+	InterlockedExchange(RWGridHeaders[CellIndex], Node + 1u, PrevHead);
+	RWNodes[Node] = uint2(Range.RecordIndex, PrevHead);
+
+	// The full header clear guarantees exactly one thread sees a zero previous head
+	// for each cell touched by this rebuild.
+	if (PrevHead == 0u)
+	{
+		uint ActiveIndex;
+#if WAVE_OPS
+		WaveInterlockedAddScalar_(RWCounters[2], 1u, ActiveIndex);
+#else
+		InterlockedAdd(RWCounters[2], 1u, ActiveIndex);
+#endif
+		RWActiveCells[ActiveIndex] = CellIndex;
+	}
+}
+
+[numthreads(1, 1, 1)]
+void SetupActiveCellIndirectArgsCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint GroupCount = (Counters[2] + THREADGROUP_SIZE - 1u) / THREADGROUP_SIZE;
+	const uint3 WrappedGroupCount = GetGroupCountWrapped(
+		GroupCount, uint2(MaxDispatchThreadGroupsPerDimension.xy));
+	WriteDispatchIndirectArgs(RWIndirectArgs, 0, WrappedGroupCount);
+}
+
+[numthreads(THREADGROUP_SIZE, 1, 1)]
+void CanonicalizeCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint ActiveIndex = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUP_SIZE);
+	if (ActiveIndex >= RWCounters[2])
+	{
+		return;
+	}
+	const uint CellIndex = ActiveCells[ActiveIndex];
+
+	const uint Head = RWGridHeaders[CellIndex];
+	if (Head == 0u)
+	{
+		return;
+	}
+
+	// Frame-rate cap: walk at most the first WORLDVOXELPAINT_MAX_EVALUATED_CANDIDATES chain
+	// nodes; an overfull cell silently drops the tail (deliberately NOT a grid-build error,
+	// and the surviving subset follows nondeterministic atomic insertion order). Cells at or
+	// under the cap walk their whole chain and keep the deterministic ascending emit below.
+	uint Count = 0u;
+	uint Node = Head;
+	[loop]
+	while (Node != 0u && Count < WORLDVOXELPAINT_MAX_EVALUATED_CANDIDATES)
+	{
+		++Count;
+		Node = Nodes[Node - 1u].y;
+	}
+
+	uint Offset;
+#if WAVE_OPS
+	// Varying-value wave aggregation: prefix-summed per-lane offsets, one global
+	// atomic per wave. Offsets stay dense and per-lane unique.
+	WaveInterlockedAdd_(RWCounters[1], Count, Offset);
+#else
+	InterlockedAdd(RWCounters[1], Count, Offset);
+#endif
+	if (Offset + Count > KCap)
+	{
+		RWErrorFlag[0] = 1u;
+		RWGridHeaders[CellIndex] = 0u;
+		return;
+	}
+
+	uint LastEmitted = 0u;
+	[loop]
+	for (uint EmitIndex = 0u; EmitIndex < Count; ++EmitIndex)
+	{
+		uint Best = 0xFFFFFFFFu;
+		uint Walk = Head;
+		[loop]
+		for (uint Step = 0u; Step < Count; ++Step)
+		{
+			const uint2 NodeData = Nodes[Walk - 1u];
+			if ((EmitIndex == 0u || NodeData.x > LastEmitted) && NodeData.x < Best)
+			{
+				Best = NodeData.x;
+			}
+			Walk = NodeData.y;
+		}
+		RWGridIndexList[Offset + EmitIndex] = Best;
+		LastEmitted = Best;
+	}
+
+	RWGridHeaders[CellIndex] = (Offset << WORLDVOXELPAINT_HEADER_COUNT_BITS) | Count;
+}
+
+[numthreads(THREADGROUP_SIZE, 1, 1)]
+void ErrorClearCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	if (ErrorFlag[0] == 0u)
+	{
+		return;
+	}
+
+	const uint ActiveIndex = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUP_SIZE);
+	if (ActiveIndex < Counters[2])
+	{
+		RWGridHeaders[ActiveCells[ActiveIndex]] = 0u;
+	}
+}

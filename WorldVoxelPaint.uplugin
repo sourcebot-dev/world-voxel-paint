@@ -1,0 +1,22 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "0.1",
+	"FriendlyName": "World Voxel Paint",
+	"Description": "Paintable world-space voxel volumes sampled by materials via a Scene UB member.",
+	"Category": "Rendering",
+	"CreatedBy": "InitialProject",
+	"EngineVersion": "5.7.0",
+	"CanContainContent": true,
+	"Installed": false,
+	"SupportedTargetPlatforms": [ "Win64", "Linux", "Mac" ],
+	"Modules": [
+		{ "Name": "WorldVoxelPaint", "Type": "Runtime", "LoadingPhase": "PostConfigInit" },
+		{ "Name": "WorldVoxelPaintToolset", "Type": "Editor", "LoadingPhase": "Default" },
+		{ "Name": "WorldVoxelPaintEditorMode", "Type": "Editor", "LoadingPhase": "Default" },
+		{ "Name": "WorldVoxelPaintPCG", "Type": "Runtime", "LoadingPhase": "PostConfigInit" }
+	],
+	"Plugins": [
+		{ "Name": "PCG", "Enabled": true }
+	]
+}

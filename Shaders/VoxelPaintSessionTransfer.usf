@@ -1,0 +1,64 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ComputeShaderUtils.ush"
+#include "/Plugin/WorldVoxelPaint/VoxelPaintSample.ush"
+
+#define WORLDVOXELPAINT_UNIQUE_BRICK 7u             // mirrors WorldVoxelPaint::UniqueBrickSize
+#define WORLDVOXELPAINT_TEXELS_PER_UNIQUE_BRICK 343u // mirrors WorldVoxelPaint::TexelsPerUniqueBrick
+
+int3 BrickCounts;
+uint NumBricks;
+StructuredBuffer<uint> BrickIndices;
+StructuredBuffer<uint> SourceTexels;
+RWTexture3D<float4> RWWorkingTexture;
+Texture3D<float4> WorkingTexture;
+RWStructuredBuffer<uint> RWGatherTexels;
+
+uint3 WVP_SessionTransferTexel(uint ThreadId)
+{
+	const uint BrickRank = ThreadId / WORLDVOXELPAINT_TEXELS_PER_UNIQUE_BRICK;
+	const uint InBrick = ThreadId % WORLDVOXELPAINT_TEXELS_PER_UNIQUE_BRICK;
+	const uint3 Brick = WVP_UnflattenPoolSlot(BrickIndices[BrickRank], BrickCounts);
+	const uint3 InBrickCoord = uint3(
+		InBrick % WORLDVOXELPAINT_UNIQUE_BRICK,
+		(InBrick / WORLDVOXELPAINT_UNIQUE_BRICK) % WORLDVOXELPAINT_UNIQUE_BRICK,
+		InBrick / (WORLDVOXELPAINT_UNIQUE_BRICK * WORLDVOXELPAINT_UNIQUE_BRICK));
+	return Brick * WORLDVOXELPAINT_UNIQUE_BRICK + InBrickCoord;
+}
+
+[numthreads(THREADGROUP_SIZE, 1, 1)]
+void ScatterCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint ThreadId = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUP_SIZE);
+	if (ThreadId >= NumBricks * WORLDVOXELPAINT_TEXELS_PER_UNIQUE_BRICK)
+	{
+		return;
+	}
+
+	const uint Packed = SourceTexels[ThreadId];
+	const float4 Value = float4(
+		(float)((Packed >> 16u) & 0xFFu),
+		(float)((Packed >> 8u) & 0xFFu),
+		(float)(Packed & 0xFFu),
+		(float)((Packed >> 24u) & 0xFFu)) * (1.0f / 255.0f);
+	RWWorkingTexture[WVP_SessionTransferTexel(ThreadId)] = Value;
+}
+
+[numthreads(THREADGROUP_SIZE, 1, 1)]
+void GatherCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint ThreadId = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUP_SIZE);
+	if (ThreadId >= NumBricks * WORLDVOXELPAINT_TEXELS_PER_UNIQUE_BRICK)
+	{
+		return;
+	}
+
+	// Round-to-nearest pack, mirroring PackUNorm4RoundNearest (fixed BGRA byte order).
+	const float4 Value = saturate(WorkingTexture.Load(int4(WVP_SessionTransferTexel(ThreadId), 0)));
+	const uint PackedB = (uint)(Value.z * 255.0f + 0.5f);
+	const uint PackedG = (uint)(Value.y * 255.0f + 0.5f);
+	const uint PackedR = (uint)(Value.x * 255.0f + 0.5f);
+	const uint PackedA = (uint)(Value.w * 255.0f + 0.5f);
+	RWGatherTexels[ThreadId] = PackedB | (PackedG << 8u) | (PackedR << 16u) | (PackedA << 24u);
+}

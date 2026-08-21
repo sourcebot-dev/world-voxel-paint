@@ -1,0 +1,331 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+#pragma once
+
+// Record lane layout: see WVP/Source/WorldVoxelPaint/Public/VoxelPaintRecord.h (single contract).
+
+#if defined(IS_BASE_PASS) && IS_MOBILE_BASE_PASS == 0
+	#define WORLDVOXELPAINT_EVALUATE 1
+#else
+	#define WORLDVOXELPAINT_EVALUATE 0
+#endif
+
+#define WORLDVOXELPAINT_MAX_EVALUATED_CANDIDATES 32u // mirrors WorldVoxelPaint::MaxEvaluatedCandidatesPerCell (per-cell/per-pixel cap, NOT the placement frontier)
+#define WORLDVOXELPAINT_RECORD_LANES 7           // mirrors WorldVoxelPaint::RecordNumFloat4Lanes
+#define WORLDVOXELPAINT_HEADER_COUNT_BITS 9      // mirrors WorldVoxelPaint::GridHeaderCountBits
+#define WORLDVOXELPAINT_HEADER_COUNT_MASK 0x1FFu // mirrors WorldVoxelPaint::GridHeaderCountMask
+#define WORLDVOXELPAINT_PAGE_ABSENT 0u           // mirrors WorldVoxelPaint::PageEntryAbsent
+#define WORLDVOXELPAINT_NO_PAGE_TABLE 0xFFFFFFFFu // mirrors WorldVoxelPaint::NoPageTableSentinel
+#define WORLDVOXELPAINT_CONTAINMENT_EPSILON (1.0f / 64.0f)   // texel units, admission-widening only
+
+float3 VoxelPaintQuatRotate(float4 Q, float3 V)
+{
+	return V + 2.0f * cross(Q.xyz, cross(Q.xyz, V) + Q.w * V);
+}
+
+struct FWVPRecord
+{
+	float4 WorldToVolumeRotation;
+	float3 VolumeCenter;
+	uint Flags;
+	float3 LocalHalfExtent;
+	uint PageTableBaseIndex;
+	float4 BlendCoefficients;
+	float3 TexelSize;
+	uint SessionSelector;
+	float3 StorageMin;
+	uint BrickCountX;
+	float3 TexelSizeRcp;
+	uint BrickCountYZ;
+};
+
+void WVP_DecodeRecord(StructuredBuffer<float4> Volumes, uint Index, out FWVPRecord OutRecord)
+{
+	const uint Base = Index * WORLDVOXELPAINT_RECORD_LANES;
+	const float4 Lane0 = Volumes[Base + 0u];
+	const float4 Lane1 = Volumes[Base + 1u];
+	const float4 Lane2 = Volumes[Base + 2u];
+	const float4 Lane3 = Volumes[Base + 3u];
+	const float4 Lane4 = Volumes[Base + 4u];
+	const float4 Lane5 = Volumes[Base + 5u];
+	const float4 Lane6 = Volumes[Base + 6u];
+
+	OutRecord.WorldToVolumeRotation = Lane0;
+	OutRecord.VolumeCenter = Lane1.xyz;
+	OutRecord.Flags = asuint(Lane1.w);
+	OutRecord.LocalHalfExtent = Lane2.xyz;
+	OutRecord.PageTableBaseIndex = asuint(Lane2.w);
+	OutRecord.BlendCoefficients = Lane3;
+	OutRecord.TexelSize = Lane4.xyz;
+	OutRecord.SessionSelector = asuint(Lane4.w);
+	OutRecord.StorageMin = Lane5.xyz;
+	OutRecord.BrickCountX = asuint(Lane5.w);
+	OutRecord.TexelSizeRcp = Lane6.xyz;
+	OutRecord.BrickCountYZ = asuint(Lane6.w);
+}
+
+void WVP_UnpackGridHeader(uint Header, out uint OutOffset, out uint OutCount)
+{
+	OutOffset = Header >> WORLDVOXELPAINT_HEADER_COUNT_BITS;
+	OutCount = Header & WORLDVOXELPAINT_HEADER_COUNT_MASK;
+}
+
+uint WVP_FlattenBrick(uint3 Brick, uint BrickCountX, uint BrickCountY)
+{
+	return Brick.x + BrickCountX * (Brick.y + BrickCountY * Brick.z);
+}
+
+uint3 WVP_UnflattenPoolSlot(uint Slot, int3 PoolDimsInBricks)
+{
+	const uint DimX = (uint)PoolDimsInBricks.x;
+	const uint DimY = (uint)PoolDimsInBricks.y;
+	uint3 Coord;
+	Coord.x = Slot % DimX;
+	const uint Slice = Slot / DimX;
+	Coord.y = Slice % DimY;
+	Coord.z = Slice / DimY;
+	return Coord;
+}
+
+uint WVP_CellIndex(uint3 Cell, int3 GridDims)
+{
+	return Cell.x + (uint)GridDims.x * (Cell.y + (uint)GridDims.y * Cell.z);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Grid-free evaluation (M6). Everything below stays in the unconditional section: any compute
+// shader including this file can sample published voxel paint without the camera-window grid by
+// looping a caller-provided, pre-culled record index list. The material entry further down
+// calls the same per-record helper, so the paint math exists exactly once in this file.
+// ---------------------------------------------------------------------------------------------
+
+// Per-record evaluation shared by the material entry and the grid-free sampler. Reproduces the
+// exact per-candidate sequence: valid-flag check -> OBB containment (epsilon admission-widening
+// only) -> session-selector branch (dense SessionTexture; MUST stay ahead of the page-table
+// chain: selector records carry the no-page-table sentinel by design, and only this branch
+// reads their content) -> no-page-table sentinel skip -> page-table indirection -> brick-pool
+// fetch. Returns true with the blend-coefficient-scaled contribution when the record
+// contributes; false (zero OutContribution) otherwise. Callers accumulate only on true, so a
+// rejected record leaves the running composite bit-identical to a skipped loop iteration.
+// Position is evaluation-origin-relative; callers do any LWC split subtract themselves.
+bool WVP_EvaluateRecord(
+	FWVPRecord Record,
+	float3 Position,
+	StructuredBuffer<uint> PageTables,
+	Texture3D BrickPool,
+	Texture3D SessionTexture,
+	SamplerState PoolSampler,
+	uint BrickSize,
+	uint UniqueBrickSize,
+	int3 PoolDimsInBricks,
+	float3 PoolTexelExtentRcp,
+	out float4 OutContribution)
+{
+	OutContribution = float4(0.0f, 0.0f, 0.0f, 0.0f);
+	if ((Record.Flags & 0x1u) == 0u)
+	{
+		return false;
+	}
+
+	const float3 LocalPosition = VoxelPaintQuatRotate(Record.WorldToVolumeRotation, Position - Record.VolumeCenter);
+	const float3 Epsilon = WORLDVOXELPAINT_CONTAINMENT_EPSILON * Record.TexelSize;
+	if (any(abs(LocalPosition) > Record.LocalHalfExtent + Epsilon))
+	{
+		return false;
+	}
+	if (Record.SessionSelector != 0u)
+	{
+		// Dense full-domain session texture path: same storage-texel mapping, Resolution =
+		// 7 * BrickCount per axis. A neutral binding (GBlackVolumeTexture) contributes zero.
+		const uint3 SessionBrickCounts = uint3(Record.BrickCountX, Record.BrickCountYZ & 0xFFFFu, Record.BrickCountYZ >> 16u);
+		const float3 SessionResolution = (float)UniqueBrickSize * float3(SessionBrickCounts);
+		float3 SessionTexel = (LocalPosition - Record.StorageMin) * Record.TexelSizeRcp - 0.5f;
+		SessionTexel = clamp(SessionTexel, 0.0f, SessionResolution - 1.0f);
+		const float3 SessionUVW = (SessionTexel + 0.5f) / SessionResolution;
+		OutContribution = Record.BlendCoefficients * SessionTexture.SampleLevel(PoolSampler, SessionUVW, 0);
+		return true;
+	}
+	if (Record.PageTableBaseIndex == WORLDVOXELPAINT_NO_PAGE_TABLE)
+	{
+		return false;
+	}
+
+	const uint3 BrickCounts = uint3(Record.BrickCountX, Record.BrickCountYZ & 0xFFFFu, Record.BrickCountYZ >> 16u);
+	const float UniqueSize = (float)UniqueBrickSize;
+	float3 Texel = (LocalPosition - Record.StorageMin) * Record.TexelSizeRcp - 0.5f;
+	Texel = clamp(Texel, 0.0f, UniqueSize * float3(BrickCounts) - 1.0f);
+	const float3 BrickFloat = floor(Texel / UniqueSize);
+	const float3 InBrick = Texel - BrickFloat * UniqueSize;
+
+	const uint PageEntry = PageTables[Record.PageTableBaseIndex
+		+ WVP_FlattenBrick(uint3(BrickFloat), BrickCounts.x, BrickCounts.y)];
+	[branch]
+	if (PageEntry == WORLDVOXELPAINT_PAGE_ABSENT)
+	{
+		return false;
+	}
+
+	const uint3 SlotCoord = WVP_UnflattenPoolSlot(PageEntry - 1u, PoolDimsInBricks);
+	const float3 SampleUVW = (float3(SlotCoord) * (float)BrickSize + InBrick + 0.5f) * PoolTexelExtentRcp;
+	const float4 Sample = BrickPool.SampleLevel(PoolSampler, SampleUVW, 0);
+	OutContribution = Record.BlendCoefficients * Sample;
+	return true;
+}
+
+// Grid-free sampler for external (non-material) consumers, e.g. the PCG data-interface path:
+// evaluates a pre-culled record index list against one evaluation-origin-relative position and
+// returns the raw painted composite over zero (no clamp - identical semantics to the material
+// entry with an unconnected CurrentColor). Matches the material path's outer sequence: the 2D
+// XY evaluation-radius cull runs first (CameraCenter is origin-relative; without the cull,
+// session-selector records would sample the dense texture at unlimited distance, diverging
+// from the render), then the capped candidate loop. The caller provides RecordIndices in
+// ASCENDING record order (the grid path canonicalizes ascending; keeps float-accumulation
+// determinism parity) and its own count; the loop additionally clamps to the shared per-point
+// candidate cap and skips out-of-range indices, mirroring the material loop's guards.
+// "Disabled / nothing published" is expressed by the caller as neutral bindings with
+// NumVolumes == 0; there is no enable flag.
+float4 WVP_SampleVoxelPaintRecords(
+	StructuredBuffer<float4> Volumes,
+	StructuredBuffer<uint> PageTables,
+	Texture3D BrickPool,
+	Texture3D SessionTexture,
+	SamplerState PoolSampler,
+	StructuredBuffer<uint> RecordIndices,
+	uint NumRecordIndices,
+	uint NumVolumes,
+	uint BrickSize,
+	uint UniqueBrickSize,
+	int3 PoolDimsInBricks,
+	float3 PoolTexelExtentRcp,
+	float3 CameraCenter,
+	float EvaluationRadiusSq,
+	float3 Position)
+{
+	float4 Result = float4(0.0f, 0.0f, 0.0f, 0.0f);
+	[branch]
+	if (NumVolumes == 0u)
+	{
+		return Result;
+	}
+	const float2 CameraDelta = Position.xy - CameraCenter.xy;
+	[branch]
+	if (dot(CameraDelta, CameraDelta) > EvaluationRadiusSq)
+	{
+		return Result;
+	}
+
+	const uint Count = min(NumRecordIndices, WORLDVOXELPAINT_MAX_EVALUATED_CANDIDATES);   // TDR guard: same per-point cap as the material loop
+	[loop]
+	for (uint ListIndex = 0u; ListIndex < Count; ++ListIndex)
+	{
+		const uint RecordIndex = RecordIndices[ListIndex];
+		if (RecordIndex >= NumVolumes)
+		{
+			continue;
+		}
+
+		FWVPRecord Record;
+		WVP_DecodeRecord(Volumes, RecordIndex, Record);
+		float4 Contribution;
+		if (WVP_EvaluateRecord(Record, Position, PageTables, BrickPool, SessionTexture, PoolSampler,
+			BrickSize, UniqueBrickSize, PoolDimsInBricks, PoolTexelExtentRcp, Contribution))
+		{
+			Result += Contribution;
+		}
+	}
+	return Result;
+}
+
+#if IS_MATERIAL_SHADER
+
+#define WVP_Volumes              Scene.VoxelPaint.Volumes
+#define WVP_GridHeaders          Scene.VoxelPaint.GridHeaders
+#define WVP_GridIndexList        Scene.VoxelPaint.GridIndexList
+#define WVP_PageTables           Scene.VoxelPaint.PageTables
+#define WVP_BrickPool            Scene.VoxelPaint.BrickPool
+#define WVP_SessionTexture       Scene.VoxelPaint.SessionTexture
+#define WVP_PoolSampler          Scene.VoxelPaint.PoolSampler
+#define WVP_NumVolumes           Scene.VoxelPaint.NumVolumes
+#define WVP_EnableFlag           Scene.VoxelPaint.EnableFlag
+#define WVP_EvaluationOriginHigh Scene.VoxelPaint.EvaluationOriginHigh
+#define WVP_EvaluationOriginLow  Scene.VoxelPaint.EvaluationOriginLow
+#define WVP_EvaluationRadiusSq   Scene.VoxelPaint.EvaluationRadiusSq
+#define WVP_CameraCenter         Scene.VoxelPaint.CameraCenter
+#define WVP_GridOrigin           Scene.VoxelPaint.GridOrigin
+#define WVP_GridDims             Scene.VoxelPaint.GridDims
+#define WVP_GridCellSize         Scene.VoxelPaint.GridCellSize
+#define WVP_BrickSize            Scene.VoxelPaint.BrickSize
+#define WVP_UniqueBrickSize      Scene.VoxelPaint.UniqueBrickSize
+#define WVP_PoolDimsInBricks     Scene.VoxelPaint.PoolDimsInBricks
+#define WVP_PoolTexelExtentRcp   Scene.VoxelPaint.PoolTexelExtentRcp
+
+#if WORLDVOXELPAINT_EVALUATE
+
+float4 SampleWorldVoxelPaint(float4 CurrentColor, FWSVector3 WorldPositionWS)
+{
+	[branch]
+	if (WVP_EnableFlag == 0u || WVP_NumVolumes == 0u)
+	{
+		return CurrentColor;
+	}
+	const FDFVector3 EvaluationOrigin = MakeDFVector3(WVP_EvaluationOriginHigh, WVP_EvaluationOriginLow);
+	const float3 Position = WSSubtractDemote(WorldPositionWS, DFToWS(EvaluationOrigin));
+
+	const float2 CameraDelta = Position.xy - WVP_CameraCenter.xy;
+	[branch]
+	if (dot(CameraDelta, CameraDelta) > WVP_EvaluationRadiusSq)
+	{
+		return CurrentColor;
+	}
+
+	const float3 CellSizes = float3(WVP_GridCellSize.x, WVP_GridCellSize.x, WVP_GridCellSize.y);
+	const float3 CellFloat = floor((Position - WVP_GridOrigin) / CellSizes);
+	[branch]
+	if (!(all(CellFloat >= 0.0f) && all(CellFloat < float3(WVP_GridDims))))
+	{
+		return CurrentColor;
+	}
+	const uint3 Cell = uint3(CellFloat);
+
+	uint SegmentOffset;
+	uint SegmentCount;
+	WVP_UnpackGridHeader(WVP_GridHeaders[WVP_CellIndex(Cell, WVP_GridDims)], SegmentOffset, SegmentCount);
+	[branch]
+	if (SegmentCount == 0u)
+	{
+		return CurrentColor;
+	}
+
+	float4 Result = CurrentColor;
+	const uint Count = min(SegmentCount, WORLDVOXELPAINT_MAX_EVALUATED_CANDIDATES);   // TDR guard: compile-time per-pixel max
+	[loop]
+	for (uint ListIndex = 0u; ListIndex < Count; ++ListIndex)
+	{
+		const uint RecordIndex = WVP_GridIndexList[SegmentOffset + ListIndex];
+		if (RecordIndex >= WVP_NumVolumes)
+		{
+			continue;
+		}
+
+		FWVPRecord Record;
+		WVP_DecodeRecord(WVP_Volumes, RecordIndex, Record);
+		float4 Contribution;
+		if (WVP_EvaluateRecord(Record, Position, WVP_PageTables, WVP_BrickPool, WVP_SessionTexture,
+			WVP_PoolSampler, WVP_BrickSize, WVP_UniqueBrickSize, WVP_PoolDimsInBricks,
+			WVP_PoolTexelExtentRcp, Contribution))
+		{
+			Result += Contribution;
+		}
+	}
+	return Result;                                  // raw composite, NO clamp
+}
+
+#else // WORLDVOXELPAINT_EVALUATE
+
+float4 SampleWorldVoxelPaint(float4 CurrentColor, FWSVector3 WorldPositionWS)
+{
+	return CurrentColor;
+}
+
+#endif // WORLDVOXELPAINT_EVALUATE
+
+#endif // IS_MATERIAL_SHADER

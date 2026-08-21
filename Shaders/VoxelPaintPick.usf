@@ -1,0 +1,153 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/WaveOpUtil.ush"
+#include "/Plugin/WorldVoxelPaint/VoxelPaintBrushMath.ush"
+
+// Mirrors WORLDVOXELPAINT_CONTAINMENT_EPSILON in VoxelPaintSample.ush (texel units,
+// admission-widening only); keep in lockstep.
+#define WVP_PICK_CONTAINMENT_EPSILON (1.0f / 64.0f)
+
+// Output lanes shared with the C++ decode: [0]=appended count, [1]=overflow flags,
+// [2..2+IndexCapacity)=flattened texel indices, then a 4-lane seed trailer:
+// asuint(brush-center texel xyz) + seed validity.
+
+RWStructuredBuffer<float4> RWSeedParams;
+StructuredBuffer<float4> SeedParams;
+RWStructuredBuffer<uint> RWOutput;
+RWStructuredBuffer<uint> RWDedupeMask;
+
+float2 CursorNdc;
+float4x4 TranslatedWorldToTexel;
+int3 Resolution;
+uint IndexCapacity;
+float BrushRadiusWorld;
+float FlattenPct;
+float MinFlattenDepthWorld;
+float AngleToleranceDeg;
+
+float3 WVPDecodeGBufferNormal(int2 Pixel)
+{
+	return SceneTexturesStruct.GBufferATexture.Load(int3(Pixel, 0)).xyz * 2.0f - 1.0f;
+}
+
+[numthreads(1, 1, 1)]
+void SeedCS()
+{
+	RWOutput[0] = 0u;
+	RWOutput[1] = 0u;
+
+	float Validity = 0.0f;
+	float3 CenterTranslatedWorld = float3(0.0f, 0.0f, 0.0f);
+	float3 BrushNormalWorld = float3(0.0f, 0.0f, 0.0f);
+
+	const float2 ViewSize = View.ViewSizeAndInvSize.xy;
+	const float2 PixelF = View.ViewRectMin.xy
+		+ float2(0.5f + 0.5f * CursorNdc.x, 0.5f - 0.5f * CursorNdc.y) * ViewSize;
+	const int2 CursorPixel = int2(floor(PixelF));
+	const bool bInRect = all(float2(CursorPixel) >= View.ViewRectMin.xy)
+		&& all(float2(CursorPixel) < View.ViewRectMin.xy + ViewSize);
+	if (bInRect)
+	{
+		const float DeviceZ = SceneTexturesStruct.SceneDepthTexture.Load(int3(CursorPixel, 0)).r;
+		if (DeviceZ > 0.0f)
+		{
+			CenterTranslatedWorld = SvPositionToTranslatedWorld(
+				float4(float2(CursorPixel) + 0.5f, DeviceZ, 1.0f));
+			BrushNormalWorld = WVPBrushSafeNormal(WVPDecodeGBufferNormal(CursorPixel));
+			Validity = 1.0f;
+		}
+	}
+
+	RWSeedParams[0] = float4(CenterTranslatedWorld, Validity);
+	RWSeedParams[1] = float4(BrushNormalWorld, 0.0f);
+
+	const float3 CenterTexel = mul(float4(CenterTranslatedWorld, 1.0f), TranslatedWorldToTexel).xyz - 0.5f;
+	RWOutput[2u + IndexCapacity + 0u] = asuint(CenterTexel.x);
+	RWOutput[2u + IndexCapacity + 1u] = asuint(CenterTexel.y);
+	RWOutput[2u + IndexCapacity + 2u] = asuint(CenterTexel.z);
+	RWOutput[2u + IndexCapacity + 3u] = Validity > 0.0f ? 1u : 0u;
+}
+
+[numthreads(PICK_THREADGROUP_DIM, PICK_THREADGROUP_DIM, 1)]
+void PickCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	if (any(float2(DispatchThreadId.xy) >= View.ViewSizeAndInvSize.xy))
+	{
+		return;
+	}
+	const float4 Seed = SeedParams[0];
+	if (Seed.w <= 0.0f)
+	{
+		return;
+	}
+
+	const int2 Pixel = int2(View.ViewRectMin.xy) + int2(DispatchThreadId.xy);
+	const float DeviceZ = SceneTexturesStruct.SceneDepthTexture.Load(int3(Pixel, 0)).r;
+	if (DeviceZ <= 0.0f)
+	{
+		return;
+	}
+
+	const float3 TranslatedWorld = SvPositionToTranslatedWorld(
+		float4(float2(Pixel) + 0.5f, DeviceZ, 1.0f));
+	const float3 Delta = TranslatedWorld - Seed.xyz;
+	if (!PassesRadius(length(Delta), BrushRadiusWorld))
+	{
+		return;
+	}
+	const float3 BrushNormal = SeedParams[1].xyz;
+	if (!PassesFlatten(dot(Delta, BrushNormal), BrushRadiusWorld, FlattenPct, MinFlattenDepthWorld))
+	{
+		return;
+	}
+	if (!PassesAngle(WVPDecodeGBufferNormal(Pixel), BrushNormal, AngleToleranceDeg))
+	{
+		return;
+	}
+
+	const float3 TexelCoord = mul(float4(TranslatedWorld, 1.0f), TranslatedWorldToTexel).xyz;
+	if (any(TexelCoord < -WVP_PICK_CONTAINMENT_EPSILON)
+		|| any(TexelCoord > float3(Resolution) + WVP_PICK_CONTAINMENT_EPSILON))
+	{
+		return;
+	}
+
+	// Rendering reads the trilinear 2x2x2 support around T = TexelCoord - 0.5; emit every
+	// texel of that support. Out-of-range corners clamp onto boundary texels and the dedupe
+	// mask absorbs the duplicates.
+	const int3 Base = int3(floor(TexelCoord - 0.5f));
+	[unroll]
+	for (uint Corner = 0u; Corner < 8u; ++Corner)
+	{
+		const int3 Texel = clamp(
+			Base + int3(Corner & 1u, (Corner >> 1u) & 1u, (Corner >> 2u) & 1u),
+			int3(0, 0, 0), Resolution - 1);
+		const uint FlatIndex = uint(Texel.x)
+			+ uint(Resolution.x) * (uint(Texel.y) + uint(Resolution.y) * uint(Texel.z));
+
+		const uint MaskBit = 1u << (FlatIndex & 31u);
+		uint PreviousWord = 0u;
+		InterlockedOr(RWDedupeMask[FlatIndex / 32u], MaskBit, PreviousWord);
+		if ((PreviousWord & MaskBit) != 0u)
+		{
+			continue;
+		}
+
+		uint WriteIndex = 0u;
+#if WAVE_OPS
+		// Wave-aggregated append: one global atomic per wave per corner iteration,
+		// lanes get densely packed indices via the wave prefix count.
+		WaveInterlockedAddScalar_(RWOutput[0], 1u, WriteIndex);
+#else
+		InterlockedAdd(RWOutput[0], 1u, WriteIndex);
+#endif
+		if (WriteIndex >= IndexCapacity)
+		{
+			uint PreviousFlags = 0u;
+			InterlockedOr(RWOutput[1], 1u, PreviousFlags);
+			continue;
+		}
+		RWOutput[2u + WriteIndex] = FlatIndex;
+	}
+}
