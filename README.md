@@ -2,6 +2,8 @@
 
 An Unreal Engine plugin for painting voxel data directly onto surfaces in a level and sampling it in materials.
 
+Jack Minnetian used an experimental planning tool we built at Sourcebot to work through a 3,000-line design with AI. He handed the finished plan to Claude, which built a working version of the plugin in one shot over 14 hours. [Read how Jack planned and built it](https://www.sourcebot.dev/blog/one-shotting-an-unreal-engine-plugin).
+
 ## Demo
 
 [![Glowing brush strokes painted onto a stone wall in Unreal Engine](https://static.sourcebot.dev/website/blog/media/one-shotting-an-unreal-engine-feature/voxel-paint-hero-poster-v3.jpg)](https://static.sourcebot.dev/website/blog/media/one-shotting-an-unreal-engine-feature/voxel-paint-hero-web-v4.mp4)
