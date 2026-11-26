@@ -6,7 +6,7 @@ Jack Minnetian used an experimental planning tool we built at Sourcebot to work 
 
 ## Demo
 
-[![Glowing brush strokes painted onto a stone wall in Unreal Engine](https://static.sourcebot.dev/website/blog/media/one-shotting-an-unreal-engine-feature/voxel-paint-hero-poster-v3.jpg)](https://static.sourcebot.dev/website/blog/media/one-shotting-an-unreal-engine-feature/voxel-paint-hero-web-v4.mp4)
+[![Glowing brush strokes painted onto a stone wall in Unreal Engine](assets/voxel-paint-demo.gif)](https://static.sourcebot.dev/website/blog/media/one-shotting-an-unreal-engine-feature/voxel-paint-hero-web-v4.mp4)
 
 [Watch the 7-second demo](https://static.sourcebot.dev/website/blog/media/one-shotting-an-unreal-engine-feature/voxel-paint-hero-web-v4.mp4)
 
